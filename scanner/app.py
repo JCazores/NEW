@@ -1,0 +1,684 @@
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from flask_mysqldb import MySQL
+from werkzeug.utils import secure_filename
+import os
+import hashlib
+import zipfile
+import re
+import json
+import bcrypt
+import subprocess
+import tempfile
+import shutil
+from datetime import datetime
+app = Flask(__name__)
+CORS(app, origins="*", allow_headers=["Content-Type", "Authorization"], methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+app.config['MYSQL_HOST']        = 'localhost'
+app.config['MYSQL_USER']        = 'scanner'
+app.config['MYSQL_PASSWORD']    = 'Scanner@123456'
+app.config['MYSQL_DB']          = 'vuln_scanner'
+app.config['MYSQL_CURSORCLASS'] = 'DictCursor'
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB
+mysql = MySQL(app)
+UPLOAD_FOLDER = 'uploads'
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+DANGEROUS_PERMISSIONS = {
+    'android.permission.READ_CONTACTS':            {'risk': 'HIGH',   'description': 'Can read your contacts'},
+    'android.permission.WRITE_CONTACTS':           {'risk': 'HIGH',   'description': 'Can modify your contacts'},
+    'android.permission.ACCESS_FINE_LOCATION':     {'risk': 'HIGH',   'description': 'Can track your exact location'},
+    'android.permission.ACCESS_COARSE_LOCATION':   {'risk': 'MEDIUM', 'description': 'Can track approximate location'},
+    'android.permission.RECORD_AUDIO':             {'risk': 'HIGH',   'description': 'Can record audio/microphone'},
+    'android.permission.CAMERA':                   {'risk': 'HIGH',   'description': 'Can access camera'},
+    'android.permission.READ_SMS':                 {'risk': 'HIGH',   'description': 'Can read SMS messages'},
+    'android.permission.SEND_SMS':                 {'risk': 'HIGH',   'description': 'Can send SMS messages'},
+    'android.permission.READ_CALL_LOG':            {'risk': 'HIGH',   'description': 'Can read call logs'},
+    'android.permission.PROCESS_OUTGOING_CALLS':   {'risk': 'HIGH',   'description': 'Can intercept calls'},
+    'android.permission.READ_EXTERNAL_STORAGE':    {'risk': 'MEDIUM', 'description': 'Can read files from storage'},
+    'android.permission.WRITE_EXTERNAL_STORAGE':   {'risk': 'MEDIUM', 'description': 'Can write files to storage'},
+    'android.permission.INTERNET':                 {'risk': 'LOW',    'description': 'Can access internet'},
+    'android.permission.RECEIVE_BOOT_COMPLETED':   {'risk': 'MEDIUM', 'description': 'Starts automatically on boot'},
+    'android.permission.REQUEST_INSTALL_PACKAGES': {'risk': 'HIGH',   'description': 'Can install other apps'},
+    'android.permission.GET_ACCOUNTS':             {'risk': 'MEDIUM', 'description': 'Can access device accounts'},
+}
+VULN_PATTERNS = {
+    'hardcoded_secrets': [
+        (r'password\s*=\s*["\'][^"\']{4,}["\']',       'Hardcoded Password',     'CRITICAL'),
+        (r'api_key\s*=\s*["\'][^"\']{8,}["\']',        'Hardcoded API Key',      'CRITICAL'),
+        (r'secret\s*=\s*["\'][^"\']{8,}["\']',         'Hardcoded Secret',       'HIGH'),
+        (r'token\s*=\s*["\'][^"\']{8,}["\']',          'Hardcoded Token',        'HIGH'),
+        (r'AIza[0-9A-Za-z\-_]{35}',                    'Google API Key Exposed', 'CRITICAL'),
+        (r'AAAA[A-Za-z0-9_-]{7}:[A-Za-z0-9_-]{140}',  'Firebase Key Exposed',   'CRITICAL'),
+    ],
+    'network_security': [
+        (r'http://',                                  'Insecure HTTP Connection',            'HIGH'),
+        (r'SSLv3|TLSv1\.0',                            'Weak SSL/TLS Version',                'HIGH'),
+        (r'setHostnameVerifier|ALLOW_ALL_HOSTNAME',    'SSL Hostname Verification Disabled',  'CRITICAL'),
+        (r'trustAllCerts|X509TrustManager',            'SSL Certificate Validation Disabled', 'CRITICAL'),
+    ],
+    'data_storage': [
+        (r'MODE_WORLD_READABLE|MODE_WORLD_WRITEABLE',  'Insecure File Permissions',            'HIGH'),
+        (r'getSharedPreferences',                      'Sensitive Data in SharedPreferences', 'MEDIUM'),
+        (r'SQLiteDatabase|openOrCreateDatabase',       'Unencrypted SQLite Database',          'MEDIUM'),
+        (r'Log\.d|Log\.v|Log\.i',                      'Debug Logging Enabled',                'LOW'),
+    ],
+    'crypto': [
+        (r'MD5|SHA1(?![\d])',                          'Weak Hash Algorithm (MD5/SHA1)',   'HIGH'),
+        (r'DES(?!ede)',                                'Weak Encryption (DES)',            'HIGH'),
+        (r'ECB',                                       'Insecure Cipher Mode (ECB)',       'HIGH'),
+        (r'Random\(\)',                                'Insecure Random Number Generator', 'MEDIUM'),
+    ],
+}
+OWASP_MAPPING = {
+    'Hardcoded Password':                  'M9: Insecure Data Storage',
+    'Hardcoded API Key':                   'M9: Insecure Data Storage',
+    'Google API Key Exposed':              'M9: Insecure Data Storage',
+    'Firebase Key Exposed':                'M9: Insecure Data Storage',
+    'Insecure HTTP Connection':            'M3: Insecure Communication',
+    'SSL Certificate Validation Disabled': 'M3: Insecure Communication',
+    'SSL Hostname Verification Disabled':  'M3: Insecure Communication',
+    'Weak SSL/TLS Version':                'M3: Insecure Communication',
+    'Weak Hash Algorithm (MD5/SHA1)':      'M5: Insufficient Cryptography',
+    'Weak Encryption (DES)':              'M5: Insufficient Cryptography',
+    'Insecure Cipher Mode (ECB)':          'M5: Insufficient Cryptography',
+    'Insecure File Permissions':           'M2: Insecure Data Storage',
+    'Debug Logging Enabled':               'M1: Improper Platform Usage',
+    # ── JADX-specific findings ──
+    'Hardcoded URL (Java)':                'M3: Insecure Communication',
+    'Hardcoded Password (Java)':           'M9: Insecure Data Storage',
+    'Hardcoded API Key (Java)':            'M9: Insecure Data Storage',
+    'Hardcoded Secret (Java)':             'M9: Insecure Data Storage',
+    'Hardcoded Token (Java)':              'M9: Insecure Data Storage',
+    'Google API Key (Java)':               'M9: Insecure Data Storage',
+    'Firebase Key (Java)':                 'M9: Insecure Data Storage',
+    'Weak SSL/TLS (Java)':                 'M3: Insecure Communication',
+    'SSL Bypass (Java)':                   'M3: Insecure Communication',
+    'Cert Validation Disabled (Java)':     'M3: Insecure Communication',
+    'Weak Hash (Java)':                    'M5: Insufficient Cryptography',
+    'Weak Encryption (Java)':              'M5: Insufficient Cryptography',
+    'ECB Mode (Java)':                     'M5: Insufficient Cryptography',
+    'Insecure Random (Java)':              'M5: Insufficient Cryptography',
+    'World-Readable File (Java)':          'M2: Insecure Data Storage',
+    'SharedPreferences Usage (Java)':      'M2: Insecure Data Storage',
+    'Unencrypted SQLite (Java)':           'M2: Insecure Data Storage',
+    'Debug Log (Java)':                    'M1: Improper Platform Usage',
+    'Reflection Usage (Java)':             'M7: Client Code Quality',
+    'Dynamic Code Loading (Java)':         'M7: Client Code Quality',
+    'Runtime Exec (Java)':                 'M8: Code Tampering',
+    'Native Library Load (Java)':          'M8: Code Tampering',
+    'WebView JS Enabled (Java)':           'M1: Improper Platform Usage',
+    'WebView File Access (Java)':          'M1: Improper Platform Usage',
+}
+
+# ── JADX Vulnerability Patterns (scans decompiled Java source) ────
+JADX_VULN_PATTERNS = [
+    (r'http://[^\s"\']+',                              'Hardcoded URL (Java)',              'HIGH'),
+    (r'password\s*=\s*["\'][^"\']{4,}["\']',          'Hardcoded Password (Java)',          'CRITICAL'),
+    (r'api_?key\s*=\s*["\'][^"\']{8,}["\']',          'Hardcoded API Key (Java)',           'CRITICAL'),
+    (r'secret\s*=\s*["\'][^"\']{8,}["\']',            'Hardcoded Secret (Java)',            'HIGH'),
+    (r'token\s*=\s*["\'][^"\']{8,}["\']',             'Hardcoded Token (Java)',             'HIGH'),
+    (r'AIza[0-9A-Za-z\-_]{35}',                       'Google API Key (Java)',              'CRITICAL'),
+    (r'AAAA[A-Za-z0-9_-]{7}:[A-Za-z0-9_-]{140}',     'Firebase Key (Java)',                'CRITICAL'),
+    (r'SSLv3|TLSv1\.0',                               'Weak SSL/TLS (Java)',                'HIGH'),
+    (r'setHostnameVerifier|ALLOW_ALL_HOSTNAME',        'SSL Bypass (Java)',                  'CRITICAL'),
+    (r'trustAllCerts|X509TrustManager',               'Cert Validation Disabled (Java)',    'CRITICAL'),
+    (r'MessageDigest\.getInstance\("MD5|SHA-1"\)',     'Weak Hash (Java)',                   'HIGH'),
+    (r'Cipher\.getInstance\("DES|RC4|RC2',            'Weak Encryption (Java)',             'HIGH'),
+    (r'Cipher\.getInstance\("[^"]*ECB',               'ECB Mode (Java)',                    'HIGH'),
+    (r'new Random\(\)',                               'Insecure Random (Java)',              'MEDIUM'),
+    (r'MODE_WORLD_READABLE|MODE_WORLD_WRITEABLE',     'World-Readable File (Java)',         'HIGH'),
+    (r'getSharedPreferences',                         'SharedPreferences Usage (Java)',      'MEDIUM'),
+    (r'SQLiteDatabase|openOrCreateDatabase',          'Unencrypted SQLite (Java)',           'MEDIUM'),
+    (r'Log\.[dviwef]\(',                              'Debug Log (Java)',                    'LOW'),
+    (r'Class\.forName|\.getDeclaredMethod|\.invoke\(','Reflection Usage (Java)',             'MEDIUM'),
+    (r'DexClassLoader|PathClassLoader',               'Dynamic Code Loading (Java)',         'HIGH'),
+    (r'Runtime\.getRuntime\(\)\.exec',                'Runtime Exec (Java)',                 'HIGH'),
+    (r'System\.loadLibrary|System\.load\(',           'Native Library Load (Java)',          'MEDIUM'),
+    (r'setJavaScriptEnabled\(true\)',                 'WebView JS Enabled (Java)',           'HIGH'),
+    (r'setAllowFileAccess\(true\)',                   'WebView File Access (Java)',          'HIGH'),
+]
+
+# ── Auth helpers ───────────────────────────────────────────────────
+def _token_to_user_id():
+    auth = request.headers.get("Authorization")
+    if not auth or not auth.startswith("Bearer "):
+        return None
+    try:
+        token = auth.split(" ", 1)[1]
+        parts = token.split("-")
+        return int(parts[1])
+    except:
+        return None
+
+def get_current_user():
+    user_id = _token_to_user_id()
+    if not user_id:
+        return None
+    cur = mysql.connection.cursor()
+    cur.execute("SELECT id, name, email, role FROM users WHERE id=%s", (user_id,))
+    user = cur.fetchone()
+    cur.close()
+    return user
+
+def require_auth():
+    user = get_current_user()
+    if not user:
+        return None, (jsonify({"error": "Unauthorized"}), 401)
+    return user, None
+
+def require_admin():
+    user, err = require_auth()
+    if err:
+        return None, err
+    if user.get("role") != "admin":
+        return None, (jsonify({"error": "Forbidden"}), 403)
+    return user, None
+
+# ── Scan helpers ───────────────────────────────────────────────────
+def calculate_file_hash(filepath):
+    sha256 = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            sha256.update(chunk)
+    return sha256.hexdigest()
+
+def extract_apk_info(filepath):
+    info = {"package_name": "Unknown", "version": "Unknown", "files": []}
+    try:
+        with zipfile.ZipFile(filepath, "r") as apk:
+            info["files"] = apk.namelist()
+            info["has_manifest"] = "AndroidManifest.xml" in apk.namelist()
+            info["has_dex"] = any(x.endswith(".dex") for x in apk.namelist())
+    except Exception as e:
+        info["error"] = str(e)
+    return info
+
+def scan_for_vulnerabilities(filepath):
+    """Original scanner — regex on raw APK contents (.smali, .xml, .json, etc.)"""
+    vulnerabilities = []
+    try:
+        with zipfile.ZipFile(filepath, "r") as apk:
+            for filename in apk.namelist():
+                if filename.endswith((".smali", ".xml", ".json", ".properties", ".txt")):
+                    try:
+                        content = apk.read(filename).decode("utf-8", errors="ignore")
+                        for category, patterns in VULN_PATTERNS.items():
+                            for pattern, vuln_name, severity in patterns:
+                                matches = re.findall(pattern, content, re.IGNORECASE)
+                                if matches:
+                                    vulnerabilities.append({
+                                        "name": vuln_name,
+                                        "severity": severity,
+                                        "category": category,
+                                        "file": filename,
+                                        "owasp": OWASP_MAPPING.get(vuln_name, "M1: Improper Platform Usage"),
+                                        "description": f"Found {len(matches)} instance(s) in {filename}",
+                                        "count": len(matches),
+                                        "scanner": "regex",
+                                    })
+                    except:
+                        pass
+    except:
+        pass
+    return vulnerabilities
+
+def scan_with_jadx(filepath):
+    """JADX scanner — decompiles APK to Java source, then runs regex patterns on .java files"""
+    vulnerabilities = []
+    jadx_path = shutil.which("jadx")
+    if not jadx_path:
+        return vulnerabilities  # jadx not installed, skip silently
+
+    tmpdir = tempfile.mkdtemp(prefix="jadx_scan_")
+    try:
+        # Decompile APK to Java source
+        result = subprocess.run(
+            [jadx_path, "--no-res", "--output-dir", tmpdir, filepath],
+            capture_output=True, text=True, timeout=120
+        )
+
+        # Walk all decompiled .java files
+        for root, _, files in os.walk(tmpdir):
+            for fname in files:
+                if not fname.endswith(".java"):
+                    continue
+                fpath = os.path.join(root, fname)
+                try:
+                    with open(fpath, "r", errors="ignore") as f:
+                        content = f.read()
+                    rel_path = os.path.relpath(fpath, tmpdir)
+                    for pattern, vuln_name, severity in JADX_VULN_PATTERNS:
+                        matches = re.findall(pattern, content, re.IGNORECASE)
+                        if matches:
+                            vulnerabilities.append({
+                                "name": vuln_name,
+                                "severity": severity,
+                                "category": "jadx_decompiled",
+                                "file": rel_path,
+                                "owasp": OWASP_MAPPING.get(vuln_name, "M1: Improper Platform Usage"),
+                                "description": f"Found {len(matches)} instance(s) in decompiled Java: {rel_path}",
+                                "count": len(matches),
+                                "scanner": "jadx",
+                            })
+                except:
+                    pass
+    except subprocess.TimeoutExpired:
+        pass  # APK too large or jadx timed out — skip
+    except Exception:
+        pass
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    return vulnerabilities
+
+def analyze_permissions(filepath):
+    found = []
+    try:
+        with zipfile.ZipFile(filepath, "r") as apk:
+            if "AndroidManifest.xml" in apk.namelist():
+                content = apk.read("AndroidManifest.xml").decode("utf-8", errors="ignore")
+                for perm, details in DANGEROUS_PERMISSIONS.items():
+                    if perm in content or perm.split(".")[-1] in content:
+                        found.append({
+                            "permission": perm,
+                            "risk": details["risk"],
+                            "description": details["description"],
+                        })
+    except:
+        pass
+    return found
+
+def calculate_risk_score(vulnerabilities, permissions):
+    score = 100
+    severity_weights = {"CRITICAL": 20, "HIGH": 10, "MEDIUM": 5, "LOW": 2}
+    risk_weights     = {"HIGH": 8, "MEDIUM": 4, "LOW": 1}
+    for v in vulnerabilities:
+        score -= severity_weights.get(v.get("severity"), 0)
+    for p in permissions:
+        score -= risk_weights.get(p.get("risk"), 0)
+    return max(0, score)
+
+def score_to_level(risk_score):
+    return (
+        "CRITICAL" if risk_score < 30 else
+        "HIGH"     if risk_score < 50 else
+        "MEDIUM"   if risk_score < 70 else
+        "LOW"
+    )
+
+def save_scan_to_db(user_id, filename, file_size, risk_score, risk_level, total_vulnerabilities, results_payload):
+    cur = mysql.connection.cursor()
+    cur.execute("""
+        INSERT INTO scans (
+            user_id, filename, file_size, status,
+            risk_score, risk_level, total_vulnerabilities,
+            results, created_at, updated_at
+        )
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    """, (
+        user_id, filename, file_size, "completed",
+        risk_score, risk_level, total_vulnerabilities,
+        json.dumps(results_payload), datetime.now(), datetime.now()
+    ))
+    mysql.connection.commit()
+    scan_id = cur.lastrowid
+    cur.close()
+    return scan_id
+
+def iso(dt):
+    return dt.isoformat() if isinstance(dt, datetime) else dt
+
+# ── Health ─────────────────────────────────────────────────────────
+@app.route("/api/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "service": "Mobile Vulnerability Scanner"})
+
+# ── Auth routes ────────────────────────────────────────────────────
+@app.route("/api/auth/register", methods=["POST"])
+def auth_register():
+    data     = request.get_json() or {}
+    name     = data.get("name", "").strip()
+    email    = data.get("email", "").strip().lower()
+    password = data.get("password", "")
+    if not name or not email or not password:
+        return jsonify({"message": "Missing fields"}), 400
+    cur = mysql.connection.cursor()
+    cur.execute("SELECT id FROM users WHERE email=%s", (email,))
+    if cur.fetchone():
+        cur.close()
+        return jsonify({"message": "Email already taken"}), 422
+    hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    cur.execute("""
+        INSERT INTO users (name, email, password, role, created_at, updated_at)
+        VALUES (%s,%s,%s,'user',NOW(),NOW())
+    """, (name, email, hashed))
+    mysql.connection.commit()
+    user_id = cur.lastrowid
+    cur.close()
+    return jsonify({
+        "token": f"token-{user_id}-{email}",
+        "user": {"id": user_id, "name": name, "email": email, "role": "user"}
+    }), 201
+
+@app.route("/api/auth/login", methods=["POST"])
+def auth_login():
+    data     = request.get_json() or {}
+    email    = data.get("email", "").strip().lower()
+    password = data.get("password", "")
+    cur = mysql.connection.cursor()
+    cur.execute("SELECT * FROM users WHERE email=%s", (email,))
+    user = cur.fetchone()
+    cur.close()
+    if not user:
+        return jsonify({"message": "Invalid credentials"}), 401
+    if not bcrypt.checkpw(password.encode("utf-8"), user["password"].encode("utf-8")):
+        return jsonify({"message": "Invalid credentials"}), 401
+    return jsonify({
+        "token": f"token-{user['id']}-{user['email']}",
+        "user": {"id": user["id"], "name": user["name"], "email": user["email"], "role": user["role"]}
+    })
+
+@app.route("/api/auth/logout", methods=["POST"])
+def auth_logout():
+    return jsonify({"message": "Logged out"})
+
+@app.route("/api/auth/user", methods=["GET"])
+def auth_user():
+    user, err = require_auth()
+    if err:
+        return err
+    return jsonify({"user": user})
+
+# ── User scan routes ───────────────────────────────────────────────
+@app.route("/api/scan/upload", methods=["POST"])
+def scan_upload():
+    user, err = require_auth()
+    if err:
+        return err
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+    file = request.files["file"]
+    if not file.filename:
+        return jsonify({"error": "No file selected"}), 400
+    if not file.filename.endswith((".apk", ".ipa")):
+        return jsonify({"error": "Only APK and IPA files are supported"}), 400
+    safe_original = secure_filename(file.filename)
+    unique_name   = f"{user['id']}_{int(datetime.now().timestamp())}_{safe_original}"
+    filepath      = os.path.join(UPLOAD_FOLDER, unique_name)
+    try:
+        file.save(filepath)
+        file_hash  = calculate_file_hash(filepath)
+        file_size  = os.path.getsize(filepath)
+        apk_info   = extract_apk_info(filepath)
+
+        # ── Run both scanners ──
+        vulns_regex = scan_for_vulnerabilities(filepath)   # original regex scanner
+        vulns_jadx  = scan_with_jadx(filepath)             # new JADX decompiler scanner
+        vulns       = vulns_regex + vulns_jadx             # combine results
+
+        perms      = analyze_permissions(filepath)
+        risk_score = calculate_risk_score(vulns, perms)
+        risk_level = score_to_level(risk_score)
+
+        severity_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
+        for v in vulns:
+            sev = v.get("severity")
+            if sev in severity_counts:
+                severity_counts[sev] += 1
+
+        # ── Scanner summary ──
+        scanner_summary = {
+            "regex_findings": len(vulns_regex),
+            "jadx_findings":  len(vulns_jadx),
+            "total":          len(vulns),
+        }
+
+        results_payload = {
+            "file_info": {
+                "name": safe_original, "size": file_size,
+                "hash_sha256": file_hash,
+                "package_name": apk_info.get("package_name", "Unknown"),
+                "version": apk_info.get("version", "Unknown"),
+                "total_files": len(apk_info.get("files", [])),
+            },
+            "severity_counts": severity_counts,
+            "vulnerabilities": vulns,
+            "permissions": perms,
+            "scanner_summary": scanner_summary,
+        }
+        scan_id = save_scan_to_db(
+            user_id=user["id"], filename=safe_original, file_size=file_size,
+            risk_score=risk_score, risk_level=risk_level,
+            total_vulnerabilities=len(vulns), results_payload=results_payload
+        )
+        return jsonify({
+            "status": "completed", "scan_id": scan_id,
+            "timestamp": datetime.now().isoformat(),
+            "file_info": results_payload["file_info"],
+            "risk_score": risk_score, "risk_level": risk_level,
+            "summary": {
+                "total_vulnerabilities": len(vulns),
+                "severity_counts": severity_counts,
+                "total_dangerous_permissions": len(perms),
+                "scanner_summary": scanner_summary,
+            },
+            "vulnerabilities": vulns,
+            "permissions": perms,
+        })
+    finally:
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        except:
+            pass
+
+@app.route("/api/scan/my", methods=["GET"])
+def scan_my():
+    user, err = require_auth()
+    if err:
+        return err
+    cur = mysql.connection.cursor()
+    cur.execute("""
+        SELECT id, filename AS app_name, risk_score, risk_level,
+               status, total_vulnerabilities AS vulnerabilities_count,
+               created_at
+        FROM scans
+        WHERE user_id IN (SELECT id FROM users WHERE email = %s)
+        ORDER BY created_at DESC
+        LIMIT 50
+    """, (user["email"],))
+    rows = cur.fetchall()
+    cur.close()
+    for r in rows:
+        r["created_at"] = iso(r.get("created_at"))
+    return jsonify({"data": rows})
+
+@app.route("/api/scan/<int:scan_id>", methods=["GET"])
+def get_scan(scan_id):
+    user, err = require_auth()
+    if err:
+        return err
+    cur = mysql.connection.cursor()
+    cur.execute("SELECT * FROM scans WHERE id=%s", (scan_id,))
+    row = cur.fetchone()
+    cur.close()
+    if not row:
+        return jsonify({"error": "Scan not found"}), 404
+    if row.get("user_id") != user["id"] and user.get("role") != "admin":
+        return jsonify({"error": "Forbidden"}), 403
+    row["created_at"] = iso(row.get("created_at"))
+    row["updated_at"] = iso(row.get("updated_at"))
+    if row.get("results"):
+        try:
+            row["results"] = json.loads(row["results"])
+        except:
+            pass
+    return jsonify(row)
+
+# ── Admin routes ───────────────────────────────────────────────────
+@app.route("/api/admin/stats", methods=["GET"])
+def admin_stats():
+    _, err = require_admin()
+    if err:
+        return err
+    cur = mysql.connection.cursor()
+    cur.execute("""
+        SELECT
+            COUNT(*) AS total_scans,
+            COUNT(DISTINCT filename) AS apps_scanned,
+            SUM(CASE WHEN risk_level='CRITICAL' THEN total_vulnerabilities ELSE 0 END) AS critical_vulns,
+            SUM(CASE WHEN risk_level='HIGH'     THEN total_vulnerabilities ELSE 0 END) AS high_vulns,
+            SUM(CASE WHEN risk_level='MEDIUM'   THEN total_vulnerabilities ELSE 0 END) AS medium_vulns,
+            SUM(CASE WHEN risk_level='LOW'      THEN total_vulnerabilities ELSE 0 END) AS low_vulns
+        FROM scans
+    """)
+    row = cur.fetchone()
+    cur.close()
+    return jsonify({
+        "total_scans":    int(row["total_scans"]    or 0),
+        "apps_scanned":   int(row["apps_scanned"]   or 0),
+        "critical_vulns": int(row["critical_vulns"] or 0),
+        "high_vulns":     int(row["high_vulns"]     or 0),
+        "medium_vulns":   int(row["medium_vulns"]   or 0),
+        "low_vulns":      int(row["low_vulns"]      or 0),
+    })
+
+@app.route("/api/admin/scans", methods=["GET"])
+def admin_all_scans():
+    _, err = require_admin()
+    if err:
+        return err
+    cur = mysql.connection.cursor()
+    cur.execute("""
+        SELECT s.id, s.filename AS app_name, s.risk_score, s.risk_level,
+               s.status, s.total_vulnerabilities AS vulnerabilities_count,
+               s.created_at, u.name AS user_name, u.email AS user_email
+        FROM scans s
+        LEFT JOIN users u ON s.user_id = u.id
+        ORDER BY s.created_at DESC
+        LIMIT 100
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    for r in rows:
+        r["created_at"] = iso(r.get("created_at"))
+    return jsonify({"data": rows})
+
+@app.route("/api/admin/scans/<int:scan_id>", methods=["GET"])
+def admin_scan_detail(scan_id):
+    _, err = require_admin()
+    if err:
+        return err
+    cur = mysql.connection.cursor()
+    cur.execute("SELECT * FROM scans WHERE id=%s", (scan_id,))
+    row = cur.fetchone()
+    cur.close()
+    if not row:
+        return jsonify({"error": "Scan not found"}), 404
+    row["created_at"] = iso(row.get("created_at"))
+    row["updated_at"] = iso(row.get("updated_at"))
+    if row.get("results"):
+        try:
+            row["results"] = json.loads(row["results"])
+        except:
+            pass
+    return jsonify(row)
+
+@app.route("/api/admin/scans/<int:scan_id>", methods=["DELETE"])
+def admin_delete_scan(scan_id):
+    _, err = require_admin()
+    if err:
+        return err
+    cur = mysql.connection.cursor()
+    cur.execute("DELETE FROM scans WHERE id=%s", (scan_id,))
+    mysql.connection.commit()
+    cur.close()
+    return jsonify({"message": "Scan deleted"})
+
+@app.route("/api/admin/users", methods=["GET"])
+def admin_users():
+    _, err = require_admin()
+    if err:
+        return err
+    cur = mysql.connection.cursor()
+    cur.execute("SELECT id, name, email, role, created_at FROM users ORDER BY created_at DESC")
+    users = cur.fetchall()
+    cur.close()
+    for u in users:
+        u["created_at"] = iso(u.get("created_at"))
+    return jsonify({"data": users})
+
+@app.route("/api/admin/users/<int:user_id>/scans", methods=["GET"])
+def admin_user_scans(user_id):
+    _, err = require_admin()
+    if err:
+        return err
+    cur = mysql.connection.cursor()
+    cur.execute("""
+        SELECT id, filename AS app_name, risk_score, risk_level,
+               status, total_vulnerabilities AS vulnerabilities_count,
+               created_at
+        FROM scans
+        WHERE user_id = %s
+        ORDER BY created_at DESC
+    """, (user_id,))
+    scans = cur.fetchall()
+    cur.close()
+    for s in scans:
+        s["created_at"] = iso(s.get("created_at"))
+    return jsonify({"data": scans})
+
+@app.route("/api/admin/users/<int:user_id>", methods=["DELETE"])
+def admin_delete_user(user_id):
+    _, err = require_admin()
+    if err:
+        return err
+    cur = mysql.connection.cursor()
+    cur.execute("DELETE FROM scans WHERE user_id=%s", (user_id,))
+    cur.execute("DELETE FROM users WHERE id=%s", (user_id,))
+    mysql.connection.commit()
+    cur.close()
+    return jsonify({"message": "User deleted"})
+
+# ── Notifications ──────────────────────────────────────────────────
+_notifications = []
+
+@app.route("/api/notifications", methods=["GET"])
+def get_notifications():
+    user, err = require_auth()
+    if err:
+        return err
+    user_notifs = [n for n in _notifications if n.get("user_id") == user["id"]]
+    return jsonify({"data": user_notifs})
+
+@app.route("/api/notifications", methods=["POST"])
+def post_notification():
+    user, err = require_auth()
+    if err:
+        return err
+    data  = request.get_json() or {}
+    notif = {
+        "id":         len(_notifications) + 1,
+        "user_id":    user["id"],
+        "message":    data.get("message", ""),
+        "type":       data.get("type", "info"),
+        "created_at": datetime.now().isoformat(),
+    }
+    _notifications.append(notif)
+    return jsonify(notif), 201
+
+@app.route("/api/notifications", methods=["DELETE"])
+def clear_notifications():
+    user, err = require_auth()
+    if err:
+        return err
+    global _notifications
+    _notifications = [n for n in _notifications if n.get("user_id") != user["id"]]
+    return jsonify({"message": "Cleared"})
+
+@app.route("/api/scan/history", methods=["GET"])
+def scan_history():
+    return scan_my()
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
